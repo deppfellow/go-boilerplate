@@ -6,6 +6,17 @@
 // can be reused accross the application runtime.
 package config
 
+import (
+	"os"
+	"strings"
+
+	"github.com/go-playground/validator/v10"
+	_ "github.com/joho/godotenv/autoload"
+	"github.com/knadh/koanf/providers/env"
+	"github.com/knadh/koanf/v2"
+	"github.com/rs/zerolog"
+)
+
 /*
 	`koanf` is a config library. Its job is to read config source
 	(e.g `.env`, yaml, json, etc) then unmarshal (i.e. decode from lower-level
@@ -13,10 +24,12 @@ package config
 */
 
 type Config struct {
-	Primary  Primary        `koanf:"primary" validate:"required"`
-	Server   ServerConfig   `koanf:"server" validate:"required"`
-	Database DatabaseConfig `koanf:"database" validate:"required"`
-	Auth     AuthConfig     `koanf:"auth" validate:"required"`
+	Primary       Primary              `koanf:"primary" validate:"required"`
+	Server        ServerConfig         `koanf:"server" validate:"required"`
+	Database      DatabaseConfig       `koanf:"database" validate:"required"`
+	Redis         RedisConfig          `koanf:"redis" validate:"required"`
+	Auth          AuthConfig           `koanf:"auth" validate:"required"`
+	Observability *ObservabilityConfig `koanf:"observability"`
 }
 
 type Primary struct {
@@ -44,7 +57,56 @@ type DatabaseConfig struct {
 	ConnMaxIdleTime int    `koanf:"conn_max_idle_time" validate:"required"`
 }
 
+type RedisConfig struct {
+	Address string `koanf:"address" validate:"required"`
+}
+
 // Storing secret key variable of authentication
 type AuthConfig struct {
 	SecretKey string `koanf:"secret_key" validate:"required"`
+}
+
+func loadConfig() (*Config, error) {
+	// Initialize logger. `ConsoleWriter` output results of the logger to console instead of
+	// any other medium like file, network, etc.
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
+
+	k := koanf.New(".")
+
+	err := k.Load(env.Provider("BOILERPLATE_", ".", func(s string) string {
+		return strings.ToLower(strings.TrimPrefix(s, "BOILERPLATE_"))
+	}), nil)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Could not load initial env variables.")
+	}
+
+	mainConfig := &Config{}
+
+	err = k.Unmarshal("", mainConfig)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Could not unmarshal main config.")
+	}
+
+	validate := validator.New()
+
+	err = validate.Struct(mainConfig)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Config validation failed.")
+	}
+
+	// Set default observability config if not provided
+	if mainConfig.Observability == nil {
+		mainConfig.Observability = DefaultObservabilityConfig()
+	}
+
+	// Override service name and environment from primary config
+	mainConfig.Observability.ServiceName = "boilerplate"
+	mainConfig.Observability.Environment = mainConfig.Primary.Env
+
+	// Validate observability config
+	if err := mainConfig.Observability.Validate(); err != nil {
+		logger.Fatal().Err(err).Msg("invalid observability config")
+	}
+
+	return mainConfig, nil
 }
