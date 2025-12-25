@@ -137,7 +137,7 @@ func (global *GlobalMiddlewares) Recover() echo.MiddlewareFunc {
 	return middleware.Recover()
 }
 
-// Secure returns Echo’s secure headers middleware.
+// Secure returns Echo’s secure headers middleware. (SRT Video Timestamp 02:44:00)
 //
 // Adds standard security-related headers.
 // It’s not a magical shield, but it stops some low-effort nonsense.
