@@ -11,30 +11,56 @@ import (
 	"github.com/newrelic/go-agent/v3/newrelic"
 )
 
+// Handler is the base handler type that holds shared application dependencies.
+//
+// It is embedded/used by concrete handlers (e.g., AuthHandler, HealthHandler) so they can
+// access shared resources via *server.Server (config, logger, db, redis, job, etc.).
 type Handler struct {
 	server *server.Server
 }
 
+// NewHandler constructs a base Handler.
+//
+// Note: it returns the struct by value. This is fine because the struct only contains
+// a pointer field (*server.Server). Copying it is cheap and still points to the same Server.
 func NewHandler(s *server.Server) Handler {
 	return Handler{server: s}
 }
 
-// ---
+// --- Generic typed handler plumbing -----------------------------------------
 
-// HandlerFunc represents a typed handler function that processes a request and returns a response
+// HandlerFunc represents a typed endpoint function that:
+//
+// - receives a validated request payload (Req)
+// - returns a response (Res) or an error
+//
+// Req must satisfy validation.Validatable.
+// In practice Req is typically a POINTER type, e.g. *CreateUserRequest,
+// because Echo's Bind requires a pointer to populate fields.
 type HandlerFunc[Req validation.Validatable, Res any] func(c echo.Context, req Req) (Res, error)
 
-// HandlerFuncNoContent represents a typed handler function that processes a request without returning content
+// HandlerFuncNoContent is a typed endpoint function for routes that return no response body
+// (e.g., 204 No Content).
 type HandlerFuncNoContent[Req validation.Validatable] func(c echo.Context, req Req) error
 
 // ResponseHandler defines the interface for handling different response types
+//
+// It defines how a successful handler result is written to the HTTP response,
+// and how observability attributes should be attached for that response type.
 type ResponseHandler interface {
+	// Handle writes the HTTP response for the given result.
 	Handle(c echo.Context, result interface{}) error
+
+	// GetOperation returns an operation name used for structured logging.
+	// This helps distinguish handler types (json/no_content/file) in logs.
 	GetOperation() string
+
+	// AddAttributes attaches New Relic attributes based on response type and/or result.
+	// This allows customization beyond the generic tracing middleware.
 	AddAttributes(txn *newrelic.Transaction, result interface{})
 }
 
-// JSONResponseHandler handles JSON responses
+// JSONResponseHandler writes JSON responses with a given status code.
 type JSONResponseHandler struct {
 	status int
 }
@@ -48,10 +74,11 @@ func (h JSONResponseHandler) GetOperation() string {
 }
 
 func (h JSONResponseHandler) AddAttributes(txn *newrelic.Transaction, result interface{}) {
-	// http.status_code is already set by tracing middleware
+	// http.status_code is already set by tracing middleware (EnhanceTracing).
 }
 
 // NoContentResponseHandler handles no-content responses
+// It writes responses with no body (typically 204).
 type NoContentResponseHandler struct {
 	status int
 }
@@ -68,7 +95,9 @@ func (h NoContentResponseHandler) AddAttributes(txn *newrelic.Transaction, resul
 	// http.status_code is already set by tracing middleware
 }
 
-// FileResponseHandler handles file responses
+// FileResponseHandler writes a file download response.
+//
+// It expects the handler result to be a []byte.
 type FileResponseHandler struct {
 	status      int
 	filename    string
@@ -76,8 +105,14 @@ type FileResponseHandler struct {
 }
 
 func (h FileResponseHandler) Handle(c echo.Context, result interface{}) error {
+	// The contract for FileResponseHandler is: handler must return []byte.
+	// If it's not []byte, this will panic; keep the contract tight.
 	data := result.([]byte)
+
+	// Force download via Content-Disposition.
 	c.Response().Header().Set("Content-Disposition", "attachment; filename="+h.filename)
+
+	// Force download via Content-Disposition.
 	return c.Blob(h.status, h.contentType, data)
 }
 
@@ -87,7 +122,7 @@ func (h FileResponseHandler) GetOperation() string {
 
 func (h FileResponseHandler) AddAttributes(txn *newrelic.Transaction, result interface{}) {
 	if txn != nil {
-		// http.status_code is already set by tracing middleware
+		// http.status_code is already set by tracing middleware (EnhanceTracing).
 		txn.AddAttribute("file.name", h.filename)
 		txn.AddAttribute("file.content_type", h.contentType)
 		if data, ok := result.([]byte); ok {
@@ -97,6 +132,17 @@ func (h FileResponseHandler) AddAttributes(txn *newrelic.Transaction, result int
 }
 
 // handleRequest is the unified handler function that eliminates code duplication
+//
+// It is the shared execution pipeline for all handlers.
+// It eliminates endpoint boilerplate by centralizing:
+//
+// - request binding + validation
+// - structured logging (with request context)
+// - New Relic tracing attributes and error reporting
+// - timing metrics (validation duration, handler duration, total duration)
+// - response writing (json / no-content / file)
+//
+// Req must satisfy validation.Validatable (usually pointer-to-struct).
 func handleRequest[Req validation.Validatable](
 	c echo.Context,
 	req Req,
@@ -108,15 +154,21 @@ func handleRequest[Req validation.Validatable](
 	path := c.Path()
 	route := path
 
-	// Get New Relic transaction from context
+	// New Relic transaction is set by the New Relic Echo middleware (nrecho).
 	txn := newrelic.FromContext(c.Request().Context())
 	if txn != nil {
+		// Attach handler name/route for easier filtering in New Relic.
 		txn.AddAttribute("handler.name", route)
-		// http.method and http.route are already set by nrecho middleware
+
+		// http.method and http.route are typically already set by nrecho middleware.
+		// Allow response handlers to attach static attributes early (if any).
 		responseHandler.AddAttributes(txn, nil)
 	}
 
 	// Get context-enhanced logger
+	//
+	// Use the context-enhanced logger set by ContextEnhancer middleware.
+	// This logger should already include correlation fields (request_id, user_id, trace ids).
 	loggerBuilder := middleware.GetLogger(c).With().
 		Str("operation", responseHandler.GetOperation()).
 		Str("method", method).
@@ -124,6 +176,9 @@ func handleRequest[Req validation.Validatable](
 		Str("route", route)
 
 	// Add file-specific fields to logger if it's a file handler
+	//
+	// If response is a file download, include file metadata in logs.
+	// Note: responseHandler is an interface; this asserts the concrete value type.
 	if fileHandler, ok := responseHandler.(FileResponseHandler); ok {
 		loggerBuilder = loggerBuilder.
 			Str("filename", fileHandler.filename).
@@ -136,8 +191,15 @@ func handleRequest[Req validation.Validatable](
 
 	logger.Info().Msg("handling request")
 
+	// ---------------- Validation phase ---------------------------------------
 	// Validation with observability
 	validationStart := time.Now()
+
+	// BindAndValidate does:
+	// - c.Bind(payload) to populate req
+	// - payload.Validate() which uses validator tags or custom validations
+	//
+	// IMPORTANT: req should be a pointer type so c.Bind can mutate it.
 	if err := validation.BindAndValidate(c, req); err != nil {
 		validationDuration := time.Since(validationStart)
 
@@ -146,11 +208,14 @@ func handleRequest[Req validation.Validatable](
 			Dur("validation_duration", validationDuration).
 			Msg("request validation failed")
 
+		// Report validation errors to New Relic as noticed errors.
 		if txn != nil {
 			txn.NoticeError(nrpkgerrors.Wrap(err))
 			txn.AddAttribute("validation.status", "failed")
 			txn.AddAttribute("validation.duration_ms", validationDuration.Milliseconds())
 		}
+
+		// Return error to let global error handler format the response.
 		return err
 	}
 
@@ -164,6 +229,7 @@ func handleRequest[Req validation.Validatable](
 		Dur("validation_duration", validationDuration).
 		Msg("request validation successful")
 
+	// ---------------- Handler execution phase --------------------------------
 	// Execute handler with observability
 	handlerStart := time.Now()
 	result, err := handler(c, req)
@@ -189,11 +255,13 @@ func handleRequest[Req validation.Validatable](
 
 	totalDuration := time.Since(start)
 
-	// Record success metrics and tracing
+	// Record success attributes for tracing/metrics.
 	if txn != nil {
 		txn.AddAttribute("handler.status", "success")
 		txn.AddAttribute("handler.duration_ms", handlerDuration.Milliseconds())
 		txn.AddAttribute("total.duration_ms", totalDuration.Milliseconds())
+
+		// Let response handler attach attributes that depend on the response payload.
 		responseHandler.AddAttributes(txn, result)
 	}
 
@@ -203,10 +271,17 @@ func handleRequest[Req validation.Validatable](
 		Dur("total_duration", totalDuration).
 		Msg("request completed successfully")
 
+	// Write the response using the configured response handler.
 	return responseHandler.Handle(c, result)
 }
 
 // Handle wraps a handler with validation, error handling, logging, metrics, and tracing
+//
+// It returns an echo.HandlerFunc so it can be registered directly on routes.
+//
+// Usage pattern (typical):
+//
+//	router.POST("/x", handler.Handle(h, myHandlerFn, http.StatusCreated, &MyReq{}))
 func Handle[Req validation.Validatable, Res any](
 	h Handler,
 	handler HandlerFunc[Req, Res],
@@ -214,12 +289,16 @@ func Handle[Req validation.Validatable, Res any](
 	req Req,
 ) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		// Adapt typed handler (Res) into the generic interface{} pipeline.
 		return handleRequest(c, req, func(c echo.Context, req Req) (interface{}, error) {
 			return handler(c, req)
 		}, JSONResponseHandler{status: status})
 	}
 }
 
+// HandleFile wraps a handler that returns file bytes ([]byte) into the unified pipeline.
+//
+// It sets response headers (Content-Disposition) and writes Blob response.
 func HandleFile[Req validation.Validatable](
 	h Handler,
 	handler HandlerFunc[Req, []byte],
@@ -240,6 +319,8 @@ func HandleFile[Req validation.Validatable](
 }
 
 // HandleNoContent wraps a handler with validation, error handling, logging, metrics, and tracing for endpoints that don't return content
+//
+// Intended for endpoints that return no body (e.g., DELETE success with 204).
 func HandleNoContent[Req validation.Validatable](
 	h Handler,
 	handler HandlerFuncNoContent[Req],
